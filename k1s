@@ -3,52 +3,114 @@
 [[ "$1" = -v || "$1" = --version ]] && { echo "0.1.2"; exit; }
 for d in jq watch curl kubectl; do which "$d" >/dev/null || { echo "Missing dependency: $d"; exit 1; }; done
 ns=${1:-default}; res=${2:-pods}
+showtype=0
+[ "$res" = "1" ] && { res="no,svc,rs,deploy"; showtype=1; }
+logo=0;
+[ "$1" = "-L" ] && { logo=1; }
 
-c() { echo -e "\033[$1m"; }
+resources=$(echo $res | sed 's/,/ /g')
+
+#MASTERIP=$(kubectl get nodes master --no-headers -o=custom-columns=IP:.status.addresses[0].address)
+#WORKER1IP=$(kubectl get nodes worker1 --no-headers -o=custom-columns=IP:.status.addresses[0].address)
+
+NODE_NUM=0
+for NODE in $(kubectl get nodes -l 'node-role.kubernetes.io/master' --no-headers | awk '{ print $1; }'); do
+    let NODE_NUM=NODE_NUM+1
+    eval export MASTER${NODE_NUM}IP=$(kubectl get nodes $NODE --no-headers -o=custom-columns=IP:.status.addresses[0].address)
+done
+NODE_NUM=0
+for NODE in $(kubectl get nodes -l '!node-role.kubernetes.io/master' --no-headers | awk '{ print $1; }'); do
+    let NODE_NUM=NODE_NUM+1
+    eval export WORKER${NODE_NUM}IP=$(kubectl get nodes $NODE --no-headers -o=custom-columns=IP:.status.addresses[0].address)
+done
+#set | grep MASTER; set | grep WORKER; exit
+
+c()  { echo -e "\033[$1m"; }
 cc() { echo -e "\033[$1;1m"; }
 
 printf Loading && while true; do printf . && sleep 0.1; done &
-
-set -o pipefail
-path=$(kubectl get "$res" "$([[ "$ns" = - ]] && echo --all-namespaces || echo -n=$ns)" -v 6 2>&1 >/dev/null | grep GET | tail -n 1 | sed -n 's#.*https://[^/]*\([a-z0-9/.-]*\).*#\1#p')
-pid=$?
-kill -9 "$!" && wait "$!" 2>/dev/null
-[[ "$pid" -ne 0 ]] && echo -e "\nInvalid resource type: $res" && exit 1
-[[ $(echo -n "${path//[^\/]}" | wc -c) -lt 5 ]] && ns=-
-res=${path##*/}
+loading=$!
 
 exec 3< <(kubectl proxy -p 0)
 port=$(head -n 1 <&3 | sed 's/.*:\([0-9]\{4,5\}\).*/\1/')
 
-file=$(mktemp)
-cat <<EOF >"$file"
+file_header=$(mktemp); files="$file_header"
+if [ $logo -ne 0 ]; then
+    cat <<EOF >"$file_header"
 $(cc 36) ____ ____ ____
 ||$(cc 33)k$(cc 36) |||$(cc 33)1$(cc 36) |||$(cc 33)s$(cc 36) ||  $(cc 0)Kubernetes Dashboard$(cc 36)
 ||__|||__|||__||  $(cc 0)Namespace: $ns$(cc 36)
-|/__\|/__\|/__\|  $(cc 0)Resources: $res$(c 0)
-
+|/__\|/__\|/__\|  $(cc 0)Resources: $resources$(c 0)
 EOF
+else
+    cat <<EOF >"$file_header"
+$(cc 33)Namespace: $ns$(c 0)
+$(cc 33)Resources: $resources$(c 0)
+EOF
+fi
 
-curl -N -s "http://localhost:$port$path?watch=true" |
-  while read -r event; do
-    name=$(jq -r '.object.metadata.name' <<<"$event")
-    case "$res" in
-    pods)
-      phase=$(jq -r '.object.status.phase' <<<"$event")
-      is_ready=$(jq -r 'if .object.status | has("conditions") then .object.status.conditions[] | if select(.type=="Ready").status=="True" then "1" else "" end else "" end' <<<"$event")
-      is_scheduled=$(jq -r 'if .object.status | has("conditions") then .object.status.conditions[] | if select(.type=="PodScheduled").status=="True" then "1" else "" end else "" end' <<<"$event")
-      [[ "$is_scheduled" && ! "$is_ready" ]] && info=NonReady || info=$phase
-      [[ "$info" = Running ]] && info=$(c 32)$info$(c 0) || info=$(c 33)$info$(c 0) ;;
-    deployments|replicasets|statefulsets)
-      spec=$(jq -r '.object.spec.replicas' <<<"$event")
-      stat=$(jq -r '.object.status.readyReplicas // 0' <<<"$event")
-      [[ "$stat" = "$spec" ]] && info="$(c 32)($stat/$spec)$(c 0)" || info="$(c 33)($stat/$spec)$(c 0)" ;;
-    esac
-    case $(jq -r .type <<<"$event") in
-      ADDED) echo "$name $info" >>"$file" ;;
-      MODIFIED) sed -i.bkp "s/^$name .*$/$name ${info//\//\\/}/" "$file" ;;
-      DELETED) sed -i.bkp "/^$name .*$/d" "$file";;
-    esac
-  done &
+#echo "MASTER1IP=$MASTER1IP WORKER1IP=$WORKER1IP"
+#env | grep -E "(MASTER|WORKER)[0-9]IP" >> $file_header
 
-watch -ctn 0.1 cat "$file"
+set -o pipefail
+
+watch_resource() {
+  local res=$1; shift
+  local file=$res_$(mktemp); files+=" $file"
+  echo > $file
+
+  path=$(kubectl get "$res" "$([[ "$ns" = - ]] && echo --all-namespaces || echo -n=$ns)" -v 6 2>&1 >/dev/null | grep GET | tail -n 1 | sed -n 's#.*https://[^/]*\([a-z0-9/.-]*\).*#\1#p')
+  pid=$?
+  kill -9 "$loading" >/dev/null 2>&1 && wait "$loading" 2>/dev/null
+  [[ "$pid" -ne 0 ]] && echo -e "\nInvalid resource type: $res" && exit 1
+  # ???? [[ $(echo -n "${path//[^\/]}" | wc -c) -lt 5 ]] && ns=-
+  res=${path##*/}
+
+  curl -N -s "http://localhost:$port$path?watch=true" |
+    while read -r event; do
+      name=$(jq -r '.object.metadata.name' <<<"$event")
+      case "$res" in
+      no*)
+        info=$(c 32)$(jq -r '.object.status.addresses[0].address' <<<"$event")$(c 0);;
+      pods)
+	      #.metadata.name,pod:.status.podIP,host:.status.hostIP
+
+        podIP=$(jq -r '.object.status.podIP' <<<"$event")
+        host=$(jq -r '.object.status.hostIP' <<<"$event")
+	#for HOST in $(set | grep -E "(MASTER|WORKER)[0-9]IP"); do
+            #HOST=${HOST%%=*}
+	#done
+	case $host in
+            $MASTER1IP) host="master1";;
+            $MASTER2IP) host="master2";;
+            $MASTER3IP) host="master3";;
+            $WORKER1IP) host="worker1";;
+            $WORKER2IP) host="worker2";;
+            $WORKER3IP) host="worker3";;
+	esac
+        phase=$(jq -r '.object.status.phase' <<<"$event")
+        is_ready=$(jq -r 'if .object.status | has("conditions") then .object.status.conditions[] | if select(.type=="Ready").status=="True" then "1" else "" 
+end else "" end' <<<"$event")
+        is_scheduled=$(jq -r 'if .object.status | has("conditions") then .object.status.conditions[] | if select(.type=="PodScheduled").status=="True" then "
+1" else "" end else "" end' <<<"$event")
+        [[ "$is_scheduled" && ! "$is_ready" ]] && info=NonReady || info=$phase
+        [[ "$info" = Running ]] && info=$(c 32)$info$(c 0) || info=$(c 33)$info$(c 0)
+	info="$info ${podIP}/${host}"
+	;;
+      deployments|replicasets|statefulsets)
+        spec=$(jq -r '.object.spec.replicas' <<<"$event")
+        stat=$(jq -r '.object.status.readyReplicas // 0' <<<"$event")
+        [[ "$stat" = "$spec" ]] && info="$(c 32)($stat/$spec)$(c 0)" || info="$(c 33)($stat/$spec)$(c 0)" ;;
+      esac
+
+      [ $showtype -ne 0 ] && name="${res}/${name}"
+      case $(jq -r .type <<<"$event") in
+        ADDED)    echo "$name $info" >>"$file" ;;
+        MODIFIED) sed -i.bkp "s|^$name .*$|$name ${info//\//\\/}|" "$file" ;;
+        DELETED)  sed -i.bkp "\\|^$name .*$|d" "$file";;
+      esac
+    done &
+}
+
+for res in $resources; do watch_resource $res; done
+watch -ctn 0.1 cat "$files"
